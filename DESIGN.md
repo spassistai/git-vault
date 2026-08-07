@@ -29,9 +29,11 @@ Argon2id(master, salt=global_salt)  →  master_key   # raz na sesję / keychain
 HKDF-SHA256(master_key, info="git-vault:v1:"+repo_id)  →  repo_key
     │
     ▼
-age (X25519 + ChaCha20-Poly1305)  lub  AES-256-GCM
+AES-256-GCM (file magic GVAULT1; filenames keep .age suffix)
     szyfruje: bundle N + manifest
 ```
+
+> MVP uses `cryptography` AES-GCM, not the `age` binary. Wire format is `GVAULT1` + nonce + ciphertext. Swap to real `age` later if desired without changing the CLI UX.
 
 | Element | Wartość |
 |---|---|
