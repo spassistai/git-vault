@@ -10,7 +10,7 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-Password: set `GIT_VAULT_PASSWORD` or enter it at the TTY prompt (Keychain later).
+Password: set `GIT_VAULT_PASSWORD` (and `GIT_VAULT_PASSWORD_CONFIRM` for `init`) or enter it at the TTY prompt.
 
 ## Usage
 
@@ -23,6 +23,7 @@ git-vault init --repo-id demo --remote /tmp/notes-vault.git
 git-vault push
 git-vault pull
 git-vault status
+git-vault status --json
 
 git-vault clone /tmp/notes-vault.git ~/code/notes
 git-vault export-key --out notes.vaultkey   # share one repo, not master password
@@ -31,7 +32,7 @@ git-vault unlock --key-file notes.vaultkey
 
 ## How it works
 
-1. Derive `repo_key = HKDF(Argon2id(master_password), repo_id)`
+1. Derive `repo_key = HKDF(Argon2id(master_password, salt_from_vault.json), repo_id)`
 2. On push: `git bundle` of new commits → AES-256-GCM → `bundles/NNNNNN.bundle.age` + encrypted manifest
 3. On pull: decrypt new bundles → `git fetch` / FF merge
 

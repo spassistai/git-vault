@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from git_vault import gitops
 from git_vault.bundles import (
@@ -11,18 +13,29 @@ from git_vault.bundles import (
     Manifest,
     bundle_filename,
     load_manifest,
+    read_vault_json,
+    read_vault_salt,
     save_manifest,
     sha256_file,
     write_vault_json,
 )
 from git_vault.crypto import (
     AuthError,
+    decrypt,
+    encrypt,
     export_vaultkey,
     get_master_password,
     import_vaultkey,
+    new_salt,
     repo_key_from_password,
 )
-from git_vault.store import StoreError, ensure_artifact_checkout, init_local_artifact_repo, pull_artifact, push_artifact
+from git_vault.store import (
+    StoreError,
+    ensure_artifact_checkout,
+    init_local_artifact_repo,
+    pull_artifact,
+    push_artifact,
+)
 from git_vault.workspace import Workspace, WorkspaceError, find_workspace, write_workspace
 
 INCOMING_REF = "refs/git-vault/incoming"
@@ -36,12 +49,12 @@ class IntegrityError(Exception):
     pass
 
 
-def _repo_key_for(repo_id: str) -> bytes:
+def _password_to_repo_key(repo_id: str, salt: bytes) -> bytes:
     password = get_master_password()
-    return repo_key_from_password(password, repo_id)
+    return repo_key_from_password(password, repo_id, salt)
 
 
-def resolve_repo_key(ws: Workspace) -> bytes:
+def resolve_repo_key(ws: Workspace, salt: bytes) -> bytes:
     key_path = ws.marker / "repo.key"
     if key_path.exists():
         data = key_path.read_bytes()
@@ -53,7 +66,7 @@ def resolve_repo_key(ws: Workspace) -> bytes:
                 return key
         except AuthError:
             pass
-    return _repo_key_for(ws.repo_id)
+    return _password_to_repo_key(ws.repo_id, salt)
 
 
 def _ensure_gitignore(root: Path) -> None:
@@ -72,6 +85,40 @@ def _ensure_gitignore(root: Path) -> None:
         gi.write_text(line + "\n", encoding="utf-8")
 
 
+def _sync_state(
+    root: Path,
+    local_head: str | None,
+    remote_head: str | None,
+) -> str:
+    if not remote_head:
+        return "remote_empty"
+    if not local_head:
+        return "local_empty"
+    if local_head == remote_head:
+        return "up_to_date"
+    if gitops.is_ancestor(root, remote_head, local_head):
+        return "ahead"
+    if gitops.is_ancestor(root, local_head, remote_head):
+        return "behind"
+    return "diverged"
+
+
+def _format_status(data: dict[str, Any]) -> str:
+    lines = [
+        f"repo_id:    {data['repo_id']}",
+        f"remote:     {data['remote']}",
+        f"last_seq:   {data['last_seq']}",
+        f"local_HEAD: {data['local_head'] or '(none)'}",
+    ]
+    if data.get("error"):
+        lines.append(f"remote:     unavailable ({data['error']})")
+        return "\n".join(lines)
+    lines.append(f"remote_HEAD:{data['remote_head'] or '(none)'}")
+    lines.append(f"bundles:    {data['bundles']}")
+    lines.append(f"sync:       {data['sync']}")
+    return "\n".join(lines)
+
+
 def cmd_init(repo_id: str | None, remote: str | None, cwd: Path | None = None) -> Workspace:
     root = (cwd or Path.cwd()).resolve()
     if not gitops.is_git_repo(root):
@@ -84,14 +131,16 @@ def cmd_init(repo_id: str | None, remote: str | None, cwd: Path | None = None) -
     if repo_id is None:
         repo_id = root.name
 
+    password = get_master_password(confirm=True)
+    salt = new_salt()
+    key = repo_key_from_password(password, repo_id, salt)
+
     cache = init_local_artifact_repo(remote, repo_id)
-    write_vault_json(cache, repo_id, 0)
-    key = _repo_key_for(repo_id)
-    save_manifest(cache, Manifest.empty(repo_id), key)
+    write_vault_json(cache, repo_id, 0, salt)
+    save_manifest(cache, Manifest.empty(repo_id), key, salt)
     push_artifact(cache, "git-vault: init empty vault")
 
     _ensure_gitignore(root)
-    # Keep tree pushable: commit .gitignore if we touched it and identity works.
     if not gitops.working_tree_clean(root) and gitops.rev_parse(root, "HEAD"):
         try:
             gitops.run_git("add", ".gitignore", cwd=root)
@@ -109,37 +158,39 @@ def cmd_init(repo_id: str | None, remote: str | None, cwd: Path | None = None) -
     return write_workspace(root, repo_id=repo_id, remote=remote, last_seq=0)
 
 
-def cmd_status(cwd: Path | None = None) -> str:
+def cmd_status(
+    cwd: Path | None = None,
+    *,
+    as_json: bool = False,
+) -> str:
     ws = find_workspace(cwd)
-    lines = [
-        f"repo_id:   {ws.repo_id}",
-        f"remote:    {ws.remote}",
-        f"last_seq:  {ws.last_seq}",
-    ]
-    head = gitops.rev_parse(ws.root, "HEAD")
-    lines.append(f"local_HEAD: {head or '(none)'}")
+    local_head = gitops.rev_parse(ws.root, "HEAD")
+    data: dict[str, Any] = {
+        "repo_id": ws.repo_id,
+        "remote": ws.remote,
+        "last_seq": ws.last_seq,
+        "local_head": local_head,
+        "remote_head": None,
+        "bundles": None,
+        "sync": None,
+        "error": None,
+    }
 
     try:
         cache = ensure_artifact_checkout(ws.remote)
         pull_artifact(cache)
-        key = resolve_repo_key(ws)
+        salt = read_vault_salt(cache)
+        key = resolve_repo_key(ws, salt)
         manifest = load_manifest(cache, key)
-        lines.append(f"remote_HEAD: {manifest.head or '(none)'}")
-        lines.append(f"bundles:   {manifest.bundle_count}")
-        if head and manifest.head and head != manifest.head:
-            if gitops.is_ancestor(ws.root, manifest.head, head):
-                lines.append("sync:      local ahead (need push)")
-            elif gitops.is_ancestor(ws.root, head, manifest.head):
-                lines.append("sync:      local behind (need pull)")
-            else:
-                lines.append("sync:      diverged")
-        elif head and manifest.head and head == manifest.head:
-            lines.append("sync:      up to date")
-        elif not manifest.head:
-            lines.append("sync:      remote empty")
+        data["remote_head"] = manifest.head
+        data["bundles"] = manifest.bundle_count
+        data["sync"] = _sync_state(ws.root, local_head, manifest.head)
     except (StoreError, AuthError) as exc:
-        lines.append(f"remote:    unavailable ({exc})")
-    return "\n".join(lines)
+        data["error"] = str(exc)
+
+    if as_json:
+        return json.dumps(data, indent=2)
+    return _format_status(data)
 
 
 def cmd_push(cwd: Path | None = None) -> str:
@@ -155,9 +206,10 @@ def cmd_push(cwd: Path | None = None) -> str:
     try:
         pull_artifact(cache)
     except StoreError:
-        pass  # may be first push to freshly inited remote
+        pass
 
-    key = resolve_repo_key(ws)
+    salt = read_vault_salt(cache)
+    key = resolve_repo_key(ws, salt)
     manifest = load_manifest(cache, key)
     if manifest.repo_id != ws.repo_id:
         raise IntegrityError(
@@ -170,7 +222,8 @@ def cmd_push(cwd: Path | None = None) -> str:
     if manifest.head is not None:
         if not gitops.is_ancestor(ws.root, manifest.head, head):
             raise ConflictError(
-                f"local HEAD is not a descendant of remote head {manifest.head[:12]}; pull/reconcile first"
+                f"local HEAD is not a descendant of remote head {manifest.head[:12]}; "
+                "pull/reconcile first"
             )
         rev_range = f"{manifest.head}..HEAD"
         from_rev = manifest.head
@@ -186,22 +239,18 @@ def cmd_push(cwd: Path | None = None) -> str:
     with tempfile.TemporaryDirectory(prefix="git-vault-") as tmp:
         raw_bundle = Path(tmp) / "bundle"
         gitops.create_bundle(ws.root, raw_bundle, rev_range)
-        plaintext = raw_bundle.read_bytes()
-        from git_vault.crypto import encrypt
+        enc_path.write_bytes(encrypt(key, raw_bundle.read_bytes()))
 
-        enc_path.write_bytes(encrypt(key, plaintext))
-
-    digest = sha256_file(enc_path)
     entry = BundleEntry(
         seq=seq,
         file=rel,
         from_rev=from_rev,
         to=head,
-        sha256=digest,
+        sha256=sha256_file(enc_path),
     )
     manifest.bundles.append(entry)
     manifest.head = head
-    save_manifest(cache, manifest, key)
+    save_manifest(cache, manifest, key, salt)
     push_artifact(cache, f"git-vault: bundle {seq:06d}")
     ws.set_last_seq(seq)
     return f"pushed bundle {seq:06d} -> {head[:12]}"
@@ -211,26 +260,23 @@ def _apply_bundle(ws: Workspace, cache: Path, entry: BundleEntry, key: bytes) ->
     path = cache / entry.file
     if not path.exists():
         raise IntegrityError(f"missing bundle file {entry.file}")
-    digest = sha256_file(path)
-    if digest != entry.sha256:
+    if sha256_file(path) != entry.sha256:
         raise IntegrityError(f"hash mismatch for {entry.file}")
-
-    from git_vault.crypto import decrypt
 
     plaintext = decrypt(key, path.read_bytes())
     with tempfile.TemporaryDirectory(prefix="git-vault-") as tmp:
         raw = Path(tmp) / "bundle"
         raw.write_bytes(plaintext)
-        # Verify bundle lists HEAD or tip
         gitops.fetch_bundle(ws.root, raw, f"HEAD:{INCOMING_REF}")
-        # First bundle on empty repo: may need checkout
         local_head = gitops.rev_parse(ws.root, "HEAD")
         if local_head is None:
             gitops.run_git("checkout", "-B", "main", INCOMING_REF, cwd=ws.root)
         else:
             if entry.from_rev and local_head != entry.from_rev:
-                # Allow if local is exactly at from_rev; otherwise conflict
-                if not gitops.is_ancestor(ws.root, entry.from_rev, "HEAD") and local_head != entry.from_rev:
+                if (
+                    not gitops.is_ancestor(ws.root, entry.from_rev, "HEAD")
+                    and local_head != entry.from_rev
+                ):
                     raise ConflictError(
                         f"cannot apply bundle {entry.seq}: local HEAD {local_head[:12]} "
                         f"!= expected {entry.from_rev[:12]}"
@@ -242,22 +288,20 @@ def _apply_bundle(ws: Workspace, cache: Path, entry: BundleEntry, key: bytes) ->
 
         tip = gitops.rev_parse(ws.root, "HEAD")
         if tip != entry.to:
-            # Bundle tip should match; after FF we expect entry.to
-            if tip != entry.to:
-                # Still OK if objects present — force branch to declared tip if ancestor
-                if tip and gitops.is_ancestor(ws.root, tip, entry.to):
-                    gitops.run_git("merge", "--ff-only", entry.to, cwd=ws.root)
-                elif tip != entry.to:
-                    raise IntegrityError(
-                        f"after bundle {entry.seq} HEAD is {tip}, expected {entry.to}"
-                    )
+            if tip and gitops.is_ancestor(ws.root, tip, entry.to):
+                gitops.run_git("merge", "--ff-only", entry.to, cwd=ws.root)
+            elif tip != entry.to:
+                raise IntegrityError(
+                    f"after bundle {entry.seq} HEAD is {tip}, expected {entry.to}"
+                )
 
 
 def cmd_pull(cwd: Path | None = None) -> str:
     ws = find_workspace(cwd)
     cache = ensure_artifact_checkout(ws.remote)
     pull_artifact(cache)
-    key = resolve_repo_key(ws)
+    salt = read_vault_salt(cache)
+    key = resolve_repo_key(ws, salt)
     manifest = load_manifest(cache, key)
     if manifest.repo_id != ws.repo_id:
         raise IntegrityError(
@@ -276,7 +320,6 @@ def cmd_pull(cwd: Path | None = None) -> str:
 
 
 def cmd_clone(remote_url: str, directory: Path | None) -> Path:
-    # Probe vault.json via cache clone
     try:
         cache = ensure_artifact_checkout(remote_url)
     except StoreError:
@@ -290,10 +333,9 @@ def cmd_clone(remote_url: str, directory: Path | None) -> Path:
     if not vault_json.exists():
         raise StoreError("remote is not a git-vault artifact repo (no vault.json)")
 
-    import json
-
-    meta = json.loads(vault_json.read_text(encoding="utf-8"))
+    meta = read_vault_json(cache)
     repo_id = str(meta["repo_id"])
+    salt = read_vault_salt(cache)
 
     dest = (directory or Path.cwd() / Path(repo_id).name).resolve()
     if dest.exists() and any(dest.iterdir()):
@@ -301,12 +343,9 @@ def cmd_clone(remote_url: str, directory: Path | None) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     gitops.init_repo(dest, bare=False)
 
-    key = _repo_key_for(repo_id)
+    key = _password_to_repo_key(repo_id, salt)
     manifest = load_manifest(cache, key)
     ws = write_workspace(dest, repo_id=repo_id, remote=remote_url, last_seq=0)
-
-    if not manifest.bundles:
-        return dest
 
     for entry in manifest.bundles:
         _apply_bundle(ws, cache, entry, key)
@@ -317,7 +356,10 @@ def cmd_clone(remote_url: str, directory: Path | None) -> Path:
 
 def cmd_export_key(out: Path, cwd: Path | None = None) -> None:
     ws = find_workspace(cwd)
-    key = resolve_repo_key(ws)
+    cache = ensure_artifact_checkout(ws.remote)
+    pull_artifact(cache)
+    salt = read_vault_salt(cache)
+    key = resolve_repo_key(ws, salt)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(export_vaultkey(ws.repo_id, key))
     out.chmod(0o600)

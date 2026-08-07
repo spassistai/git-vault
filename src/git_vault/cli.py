@@ -102,10 +102,14 @@ def push() -> None:
 
 
 @app.command()
-def status() -> None:
+def status(
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON status"
+    ),
+) -> None:
     """Show vault sync status for the current working tree."""
     try:
-        msg = ops.cmd_status()
+        msg = ops.cmd_status(as_json=as_json)
     except Exception as exc:
         _handle(exc)
         return

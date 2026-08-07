@@ -18,10 +18,6 @@ def cache_dir() -> Path:
     return path
 
 
-def salt_path() -> Path:
-    return config_dir() / "salt"
-
-
 def artifact_cache_path(remote: str) -> Path:
     digest = hashlib.sha256(remote.encode()).hexdigest()[:16]
     cache_dir().mkdir(parents=True, exist_ok=True)

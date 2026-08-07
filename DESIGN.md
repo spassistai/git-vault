@@ -38,8 +38,8 @@ AES-256-GCM (file magic GVAULT1; filenames keep .age suffix)
 | Element | Wartość |
 |---|---|
 | `repo_id` | kanoniczna nazwa vaultu, np. `github.com/user/my-notes` (nie lokalna ścieżka) |
-| `global_salt` | stały per instalacja, w `~/.config/git-vault/salt` (losowy 16B, nie sekret sam w sobie) |
-| KDF | Argon2id, parametry ~0.5–1 s na urządzeniu użytkownika |
+| `salt` | 16B losowy, **zapisany w `vault.json` na remote** (nie sekret — umożliwia ten sam master-password na wielu maszynach) |
+| KDF | Argon2id(password, salt z vault.json) → HKDF(repo_id) |
 | Per-repo key | 32 bajty; eksportowalny do share |
 
 **Share bez master-password:** eksport `repo_key` jako plik `*.vaultkey` albo passphrase-wrap; odbiorca: `git-vault unlock --key-file …`. Alternatywa: `age` recipients (klucz publiczny współpracownika).
@@ -67,7 +67,8 @@ my-notes-vault/                 # repo na GitHubie
 {
   "format": "git-vault/1",
   "repo_id": "github.com/user/my-notes",
-  "bundle_count": 2
+  "bundle_count": 2,
+  "salt": "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 }
 ```
 
@@ -118,12 +119,11 @@ Konfiguracja globalna:
 
 ```
 ~/.config/git-vault/
-├── salt
-├── config.toml                  # domyślny remote host, age recipients, …
-└── (opcjonalnie) keychain hint
+└── config.toml                  # opcjonalne (przyszłość)
 ```
 
-Hasło: macOS Keychain / `GIT_VAULT_PASSWORD` / interaktywny prompt. **Nigdy** w skillu ani w czacie na stałe.
+Hasło: `GIT_VAULT_PASSWORD` (+ `GIT_VAULT_PASSWORD_CONFIRM` przy `init`) / TTY prompt z potwierdzeniem przy `init`. **Nigdy** w skillu ani w czacie na stałe.
+Salt jest w `vault.json` na artifact remote (plaintext hex) — ten sam master-password działa na wielu maszynach.
 
 ---
 
@@ -146,8 +146,9 @@ git-vault pull
 # Zrób bundle od last_seq, zaszyfruj, wypchnij do remote vault
 git-vault push
 
-# Status: last_seq, head lokalny vs manifest, czy są niepushnięte commity
+# Status: last_seq, head lokalny vs manifest, sync state
 git-vault status
+git-vault status --json
 
 # Eksport klucza jednego repo (share)
 git-vault export-key [--out path.vaultkey]

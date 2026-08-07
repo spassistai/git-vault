@@ -11,8 +11,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from git_vault.paths import salt_path
-
 MAGIC = b"GVAULT1\0"
 NONCE_LEN = 12
 REPO_KEY_LEN = 32
@@ -28,23 +26,37 @@ class AuthError(Exception):
     """Missing or invalid credentials / ciphertext."""
 
 
-def ensure_salt() -> bytes:
-    path = salt_path()
-    if path.exists():
-        data = path.read_bytes()
-        if len(data) != SALT_LEN:
-            raise AuthError(f"corrupt salt file: {path}")
-        return data
-    data = secrets.token_bytes(SALT_LEN)
-    path.write_bytes(data)
-    path.chmod(0o600)
-    return data
+def new_salt() -> bytes:
+    return secrets.token_bytes(SALT_LEN)
 
 
-def get_master_password(prompt: str = "git-vault master password: ") -> str:
+def parse_salt_hex(value: str) -> bytes:
+    try:
+        salt = bytes.fromhex(value.strip())
+    except ValueError as exc:
+        raise AuthError("invalid salt hex in vault.json") from exc
+    if len(salt) != SALT_LEN:
+        raise AuthError(f"salt must be {SALT_LEN} bytes")
+    return salt
+
+
+def get_master_password(
+    prompt: str = "git-vault master password: ",
+    *,
+    confirm: bool = False,
+) -> str:
     env = os.environ.get("GIT_VAULT_PASSWORD")
     if env is not None and env != "":
-        return env
+        password = env
+        if confirm:
+            confirm_env = os.environ.get("GIT_VAULT_PASSWORD_CONFIRM")
+            if confirm_env is None:
+                raise AuthError(
+                    "password confirmation required: set GIT_VAULT_PASSWORD_CONFIRM"
+                )
+            if confirm_env != password:
+                raise AuthError("passwords do not match")
+        return password
     if not os.isatty(0):
         raise AuthError(
             "no password: set GIT_VAULT_PASSWORD or run in a TTY to prompt"
@@ -52,12 +64,16 @@ def get_master_password(prompt: str = "git-vault master password: ") -> str:
     password = getpass(prompt)
     if not password:
         raise AuthError("empty password")
+    if confirm:
+        again = getpass("Confirm master password: ")
+        if again != password:
+            raise AuthError("passwords do not match")
     return password
 
 
-def derive_master_key(password: str, salt: bytes | None = None) -> bytes:
-    if salt is None:
-        salt = ensure_salt()
+def derive_master_key(password: str, salt: bytes) -> bytes:
+    if len(salt) != SALT_LEN:
+        raise AuthError(f"salt must be {SALT_LEN} bytes")
     kdf = Argon2id(
         salt=salt,
         length=REPO_KEY_LEN,
@@ -80,8 +96,8 @@ def derive_repo_key(master_key: bytes, repo_id: str) -> bytes:
     return hkdf.derive(master_key)
 
 
-def repo_key_from_password(password: str, repo_id: str) -> bytes:
-    return derive_repo_key(derive_master_key(password), repo_id)
+def repo_key_from_password(password: str, repo_id: str, salt: bytes) -> bytes:
+    return derive_repo_key(derive_master_key(password, salt), repo_id)
 
 
 def encrypt(repo_key: bytes, plaintext: bytes) -> bytes:

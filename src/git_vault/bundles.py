@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from git_vault.crypto import decrypt, encrypt
+from git_vault.crypto import AuthError, decrypt, encrypt, parse_salt_hex
 
 FORMAT = "git-vault/1"
 
@@ -84,11 +84,17 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def write_vault_json(artifact_root: Path, repo_id: str, bundle_count: int) -> None:
+def write_vault_json(
+    artifact_root: Path,
+    repo_id: str,
+    bundle_count: int,
+    salt: bytes,
+) -> None:
     data = {
         "format": FORMAT,
         "repo_id": repo_id,
         "bundle_count": bundle_count,
+        "salt": salt.hex(),
     }
     (artifact_root / "vault.json").write_text(
         json.dumps(data, indent=2) + "\n", encoding="utf-8"
@@ -100,11 +106,23 @@ def read_vault_json(artifact_root: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def save_manifest(artifact_root: Path, manifest: Manifest, repo_key: bytes) -> None:
+def read_vault_salt(artifact_root: Path) -> bytes:
+    meta = read_vault_json(artifact_root)
+    if "salt" not in meta:
+        raise AuthError("vault.json missing salt (re-init or migrate vault)")
+    return parse_salt_hex(str(meta["salt"]))
+
+
+def save_manifest(
+    artifact_root: Path,
+    manifest: Manifest,
+    repo_key: bytes,
+    salt: bytes,
+) -> None:
     plaintext = json.dumps(manifest.to_dict(), indent=2).encode("utf-8")
     blob = encrypt(repo_key, plaintext)
     (artifact_root / "manifest.age").write_bytes(blob)
-    write_vault_json(artifact_root, manifest.repo_id, manifest.bundle_count)
+    write_vault_json(artifact_root, manifest.repo_id, manifest.bundle_count, salt)
 
 
 def load_manifest(artifact_root: Path, repo_key: bytes) -> Manifest:
