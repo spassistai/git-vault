@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$HOME/.claude/hooks/git-vault-guard.sh\"",
+            "statusMessage": "git-vault guard"
+          }
+        ]
+      }
+    ]
+  }
+}

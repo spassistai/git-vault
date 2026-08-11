@@ -46,6 +46,12 @@ cp -R skills/cursor/git-vault ~/.cursor/skills/
 mkdir -p ~/.claude/skills && cp -R skills/claude/git-vault ~/.claude/skills/
 ```
 
+## Claude Code hook
+
+A `PreToolUse` hook that blocks a plain `git push` inside a git-vault
+workspace and redirects to `git-vault push`, so plaintext never leaks to a
+wrong remote. Install per developer — see [hooks/README.md](hooks/README.md).
+
 ## Dev
 
 ```bash
