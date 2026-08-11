@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -119,6 +120,15 @@ def _format_status(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _normalize_remote(remote: str) -> str:
+    # Filesystem remotes must be stored absolute: the workspace's cwd differs
+    # between commands (clone dest vs. original repo), so a relative path
+    # written at init/clone time breaks later push/pull.
+    if "://" in remote or re.match(r"^[^/@]+@[^/:]+:", remote):
+        return remote
+    return str(Path(remote).expanduser().resolve())
+
+
 def cmd_init(repo_id: str | None, remote: str | None, cwd: Path | None = None) -> Workspace:
     root = (cwd or Path.cwd()).resolve()
     if not gitops.is_git_repo(root):
@@ -128,6 +138,7 @@ def cmd_init(repo_id: str | None, remote: str | None, cwd: Path | None = None) -
 
     if remote is None:
         raise WorkspaceError("--remote is required (artifact git URL or local path)")
+    remote = _normalize_remote(remote)
     if repo_id is None:
         repo_id = root.name
 
@@ -319,7 +330,8 @@ def cmd_pull(cwd: Path | None = None) -> str:
     return f"pulled {len(pending)} bundle(s); HEAD={gitops.rev_parse(ws.root, 'HEAD')}"
 
 
-def cmd_clone(remote_url: str, directory: Path | None) -> Path:
+def cmd_clone(remote_url: str, directory: Path | None, key_file: Path | None = None) -> Path:
+    remote_url = _normalize_remote(remote_url)
     try:
         cache = ensure_artifact_checkout(remote_url)
     except StoreError:
@@ -343,9 +355,18 @@ def cmd_clone(remote_url: str, directory: Path | None) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     gitops.init_repo(dest, bare=False)
 
-    key = _password_to_repo_key(repo_id, salt)
+    if key_file is not None:
+        key_repo_id, key = import_vaultkey(key_file.read_bytes())
+        if key_repo_id != repo_id:
+            raise AuthError(f"vaultkey repo_id {key_repo_id} != vault {repo_id}")
+    else:
+        key = _password_to_repo_key(repo_id, salt)
     manifest = load_manifest(cache, key)
     ws = write_workspace(dest, repo_id=repo_id, remote=remote_url, last_seq=0)
+    if key_file is not None:
+        key_path = ws.marker / "repo.key"
+        key_path.write_bytes(key)
+        key_path.chmod(0o600)
 
     for entry in manifest.bundles:
         _apply_bundle(ws, cache, entry, key)

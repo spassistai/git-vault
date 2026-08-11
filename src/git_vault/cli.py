@@ -69,10 +69,13 @@ def init(
 def clone(
     remote_url: str = typer.Argument(..., help="Vault artifact remote URL"),
     directory: Optional[Path] = typer.Argument(None, help="Target directory"),
+    key_file: Optional[Path] = typer.Option(
+        None, "--key-file", help="Shared *.vaultkey (skips master password)"
+    ),
 ) -> None:
     """Clone vault remote and materialize plaintext working tree."""
     try:
-        dest = ops.cmd_clone(remote_url, directory)
+        dest = ops.cmd_clone(remote_url, directory, key_file=key_file)
     except Exception as exc:
         _handle(exc)
         return

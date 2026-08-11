@@ -28,6 +28,7 @@ git-vault status --json
 git-vault clone /tmp/notes-vault.git ~/code/notes
 git-vault export-key --out notes.vaultkey   # share one repo, not master password
 git-vault unlock --key-file notes.vaultkey
+git-vault clone --key-file notes.vaultkey /tmp/notes-vault.git  # first clone without master password
 ```
 
 ## How it works

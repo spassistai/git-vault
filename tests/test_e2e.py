@@ -174,3 +174,79 @@ def test_status_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert data["bundles"] == 1
     assert data["error"] is None
     assert data["local_head"] == data["remote_head"]
+
+
+def test_relative_remote_path_survives_cwd_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    _set_pw(monkeypatch, "test-master-password")
+
+    bare = tmp_path / "artifact.git"
+    project = tmp_path / "project"
+    _init_project(project)
+
+    monkeypatch.chdir(tmp_path)
+    ops.cmd_init(repo_id="demo", remote="./artifact.git", cwd=project)
+    ops.cmd_push(cwd=project)
+
+    dest = tmp_path / "clone"
+    ops.cmd_clone("./artifact.git", dest)
+
+    (dest / "extra.txt").write_text("x\n", encoding="utf-8")
+    _git(dest, "add", "extra.txt")
+    _git(dest, "config", "user.email", "test@example.com")
+    _git(dest, "config", "user.name", "Test")
+    _git(dest, "commit", "-m", "extra")
+
+    # push/pull run from the workspace dir, not where init/clone happened
+    monkeypatch.chdir(dest)
+    ops.cmd_push(cwd=dest)
+    ops.cmd_pull(cwd=project)
+    assert (project / "extra.txt").read_text(encoding="utf-8") == "x\n"
+
+
+def test_clone_with_key_file_no_master_password(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    _set_pw(monkeypatch, "test-master-password")
+
+    bare = tmp_path / "artifact.git"
+    project = tmp_path / "project"
+    _init_project(project)
+    ops.cmd_init(repo_id="demo", remote=str(bare), cwd=project)
+    ops.cmd_push(cwd=project)
+
+    key_file = tmp_path / "demo.vaultkey"
+    ops.cmd_export_key(key_file, cwd=project)
+
+    # employee machine: wrong/absent master password, only the vaultkey
+    monkeypatch.setenv("HOME", str(tmp_path / "home2"))
+    _set_pw(monkeypatch, "not-the-master-password")
+    dest = tmp_path / "employee"
+    ops.cmd_clone(str(bare), dest, key_file=key_file)
+    assert (dest / "README.md").read_text(encoding="utf-8") == "hello\n"
+    assert (dest / ".git-vault" / "repo.key").exists()
+
+    # and push/pull work without ever knowing the master password
+    (dest / "work.txt").write_text("done\n", encoding="utf-8")
+    _git(dest, "add", "work.txt")
+    _git(dest, "config", "user.email", "emp@example.com")
+    _git(dest, "config", "user.name", "Emp")
+    _git(dest, "commit", "-m", "work")
+    ops.cmd_push(cwd=dest)
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    _set_pw(monkeypatch, "test-master-password")
+    ops.cmd_pull(cwd=project)
+    assert (project / "work.txt").read_text(encoding="utf-8") == "done\n"
+
+    # wrong key file is rejected
+    other = tmp_path / "other"
+    _init_project(other)
+    ops.cmd_init(repo_id="other", remote=str(tmp_path / "other.git"), cwd=other)
+    other_key = tmp_path / "other.vaultkey"
+    ops.cmd_export_key(other_key, cwd=other)
+    with pytest.raises(AuthError):
+        ops.cmd_clone(str(bare), tmp_path / "employee2", key_file=other_key)
